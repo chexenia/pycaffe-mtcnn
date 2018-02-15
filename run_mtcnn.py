@@ -10,40 +10,10 @@ import cv2
 import caffe
 
 import numpy as np
+import click
 
-
-def draw_and_show(im, bboxes, points=None):
-    '''Draw bboxes and points on image, and show.
-
-    Args:
-      im: image to draw on.
-      bboxes: (tensor) bouding boxes sized [N,4].
-      points: (tensor) landmark points sized [N,10],
-        coordinates arranged as [x,x,x,x,x,y,y,y,y,y].
-    '''
-    print('Drawing..')
-
-    num_boxes = bboxes.shape[0]
-    for i in range(num_boxes):
-        box = bboxes[i]
-        x1 = int(box[0])
-        y1 = int(box[1])
-        x2 = int(box[2])
-        y2 = int(box[3])
-        print('Rect:', y1, x1, y2, x2)
-        # As im is rotated, so need to swap x and y.
-        cv2.rectangle(im, (y1,x1), (y2,x2), (0,255,255), 2)
-
-        if points.size:
-            p = points[i]
-            for i in range(5):
-                x = int(p[i])
-                y = int(p[i+5])
-                # Again, swap x and y.
-                cv2.circle(im, (y,x), 1, (0,0,255), 2)
-
-    cv2.imshow('result', im)
-    cv2.waitKey(0)
+import reco2.common as cmn
+import reco2.utilities.landmarks as ldm
 
 def non_max_suppression(bboxes, threshold=0.5, mode='union'):
     '''Non max suppression.
@@ -281,7 +251,7 @@ def get_inputs_from_bboxes(im, bboxes, size):
     return inputs
 
 
-def main(image_path):
+def run(image_path):
     # Load image.
     im = cv2.imread(image_path)
     assert im is not None, 'Image is empty.'
@@ -361,7 +331,7 @@ def main(image_path):
 
     print('After PNet bboxes shape: ', bboxes.shape)
     if bboxes.shape[0] == 0:
-        return
+        return None
 
     # --------------------------------------------------------------
     # Second stage.
@@ -382,7 +352,7 @@ def main(image_path):
 
     print('After RNet bboxes shape: ', bboxes.shape)
     if bboxes.shape[0] == 0:
-        return
+        return None
 
     # --------------------------------------------------------------
     # Third stage.
@@ -403,23 +373,133 @@ def main(image_path):
 
     print('After ONet bboxes shape: ', bboxes.shape, '\n')
     if bboxes.shape[0] == 0:
-        return
+        return None
 
     t2 = time.time()
     print('Total time: %.3fs\n' % (t2-t1))
 
-    draw_and_show(im_bk, bboxes, points)
+    return im_bk, bboxes, points
+
+def prepare_centerloss(image, points):
+    ar=[[points[0], points[5]],  # left eye
+        [points[1], points[6]],  # right eye
+        [points[2], points[7]],  # nose
+        [points[3], points[8]],  # left corner mouth
+        [points[4], points[9]]]
+    pts_src = np.array(ar, dtype=np.float32)
+    pts_src = np.fliplr(pts_src)
+    pts_dst = np.array([[30.3, 51.7], [65.5, 51.5], [48.0, 71.0], [33.5, 92.3], [62.7, 92.2]], dtype=np.float32)
+
+    #custom homography calculation
+    # centerX_dst=(pts_dst[0,0]+pts_dst[1,0]+pts_dst[2,0]+pts_dst[3,0]+pts_dst[4,0])/5.0
+    # centerY_dst = (pts_dst[0, 1] + pts_dst[1, 1] + pts_dst[2, 1] + pts_dst[3, 1] + pts_dst[4, 1]) / 5.0
+    # eyeX_dst=(pts_dst[0,0]+pts_dst[1,0])/2.0
+    # eyeY_dst = (pts_dst[0, 1] + pts_dst[1, 1]) / 2.0
+
+    # centerX_src = (pts_src[0, 0] + pts_src[1, 0] + pts_src[3, 0] + pts_src[4, 0]) / 4.0
+    # centerY_src = (pts_src[0, 1] + pts_src[1, 1]  + pts_src[3, 1] + pts_src[4, 1]) / 4.0
+    # eyeX_src = (pts_src[0, 0] + pts_src[1, 0]) / 2.0
+    # eyeY_src = (pts_src[0, 1] + pts_src[1, 1]) / 2.0
+
+    # a=(eyeX_src-centerX_src)/(eyeY_src-centerY_src)
+    # alpha=np.arctan(a)
+    # scale=1.0/(np.sqrt( (eyeX_src-centerX_src)*(eyeX_src-centerX_src)+(eyeY_src-centerY_src)*(eyeY_src-centerY_src))/(-eyeY_dst+centerY_dst))
+
+    # newX=centerX_src*scale*np.cos(alpha)-centerY_src*scale*np.sin(alpha)
+    # newY = centerX_src * scale * np.sin(alpha) + centerY_src * scale * np.cos(alpha)
+
+    # h=np.float32([[scale*np.cos(alpha), -scale*np.sin(alpha), -newX+centerX_dst], [scale*np.sin(alpha),scale*np.cos(alpha), -newY+centerY_dst]])
+
+
+    h = cv2.estimateRigidTransform(pts_src, pts_dst, fullAffine=True)
+    im_per = cv2.warpAffine(image,h,(96,112))
+    #im_per = cv2.warpPerspective(image, h, (96, 112))
+
+    return im_per
+
+def vizualize(im, bboxes, points):
+    '''Draw bboxes and points on image.
+
+    Args:
+      im: image to draw on.
+      bboxes: (tensor) bouding boxes sized [N,4].
+      points: (tensor) landmark points sized [N,10],
+        coordinates arranged as [x,x,x,x,x,y,y,y,y,y].
+    '''
+    num_boxes = bboxes.shape[0]
+    for i in range(num_boxes):
+        box = bboxes[i]
+        x1 = int(box[0])
+        y1 = int(box[1])
+        x2 = int(box[2])
+        y2 = int(box[3])
+        print('Rect:', y1, x1, y2, x2)
+        # As im is rotated, so need to swap x and y.
+        cv2.rectangle(im, (y1,x1), (y2,x2), (0,255,255), 2)
+
+        if points.size:
+            p = points[i]
+            for i in range(5):
+                x = int(p[i])
+                y = int(p[i+5])
+                # Again, swap x and y.
+                cv2.circle(im, (y,x), 1, (0,0,255), 2)
+    return im
+
+@click.command()
+@click.option('--inpath', type=click.Path(exists=True), required=True, help='path to input folder')
+@click.option('--outpath', type=click.Path(), required=True, help='path to output folder')
+@click.option('--filetype', default='.png')
+@click.option('--viz', is_flag=True, help='Visuzlize detected boxes and landmarks')
+@click.option('--gpu', is_flag=True, help='Use gpu')
+@click.option('--centerloss', is_flag=True, help='Save images prepared for centerloss')
+def run_mtcnn(inpath, outpath, filetype, viz, gpu, centerloss):
+    if gpu:
+        gpu_id = int(sys.argv[2])
+        caffe.set_mode_gpu()
+        caffe.set_device(0)
+    
+    print('Computing landmarks and bboxes')
+
+    files = cmn.enumerateFiles(inpath, [filetype])
+
+    for f in files:
+        print(f)
+        res = run(f)
+        if res:
+            im, bboxes, points = res 
+            outp = f.replace(inpath, outpath)
+            outfolder, outf = os.path.split(outp)
+            if not os.path.exists(outfolder):
+                os.makedirs(outfolder)
+
+            outname = os.path.splitext(outf)[0]
+
+            #choose largest face:
+            print(bboxes, points)
+            if centerloss:
+                outcls = os.path.join(outfolder, outname +'_cls.png')
+                imcls = prepare_centerloss(im, points[0])
+                cv2.imwrite(outcls, imcls)
+
+            if viz:
+                outviz = os.path.join(outfolder, outname +'_viz.png')
+                imviz = vizualize(im, bboxes, points)
+                cv2.imwrite(outviz, imviz)
+
+            #save landmarks
+            outldms = os.path.join(outfolder, outname +'.pts')
+            pts = np.asarray(points[0], dtype=np.float32).reshape((5, 2))
+            ldm.save_ldms2d(outldms, pts)
+
+            ininfo = os.path.join(os.path.dirname(f), 'info.txt')
+            outinfo = oa.path.join(outfolder, 'info.txt')
+            if os.path.exists(ininfo) and not os.path.exists(outinfo):
+                shutil.copy(ininfo, outfolder)
+
+        else:
+            print('..failed')
 
 
 if __name__ == '__main__':
-    if len(sys.argv) < 2:
-        print('Usage: python main.py [image_path] [optional: GPU_ID]')
-    else:
-        if len(sys.argv) > 2:
-            # Use GPU.
-            gpu_id = int(sys.argv[2])
-            caffe.set_mode_gpu()
-            caffe.set_device(gpu_id)
-
-        image_path = sys.argv[1]
-        main(image_path)
+    run_mtcnn()
